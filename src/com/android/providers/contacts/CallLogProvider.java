@@ -41,11 +41,16 @@ import android.os.UserHandle;
 import android.os.UserManager;
 import android.provider.CallLog;
 import android.provider.CallLog.Calls;
+import android.telephony.SubscriptionInfo;
+import android.telephony.SubscriptionManager;
+import android.telephony.TelephonyManager;
 import android.telecom.PhoneAccount;
 import android.telecom.PhoneAccountHandle;
 import android.telecom.TelecomManager;
 import android.text.TextUtils;
 import android.util.Log;
+
+import com.android.internal.telephony.PhoneConstants;
 import com.android.providers.contacts.CallLogDatabaseHelper.DbProperties;
 import com.android.providers.contacts.CallLogDatabaseHelper.Tables;
 import com.android.providers.contacts.util.SelectionBuilder;
@@ -66,6 +71,8 @@ public class CallLogProvider extends ContentProvider {
 
     private static final int BACKGROUND_TASK_INITIALIZE = 0;
     private static final int BACKGROUND_TASK_ADJUST_PHONE_ACCOUNT = 1;
+
+    private static final String GROUP_BY = "groupby";
 
     /** Selection clause for selecting all calls that were made after a certain time */
     private static final String MORE_RECENT_THAN_SELECTION = Calls.DATE + "> ?";
@@ -151,6 +158,8 @@ public class CallLogProvider extends ContentProvider {
         sCallsProjectionMap.put(Calls.CACHED_FORMATTED_NUMBER, Calls.CACHED_FORMATTED_NUMBER);
         sCallsProjectionMap.put(Calls.ADD_FOR_ALL_USERS, Calls.ADD_FOR_ALL_USERS);
         sCallsProjectionMap.put(Calls.LAST_MODIFIED, Calls.LAST_MODIFIED);
+        sCallsProjectionMap.put(CallLogDatabaseHelper.CALLS_OPERATOR,
+                CallLogDatabaseHelper.CALLS_OPERATOR);
     }
 
     private HandlerThread mBackgroundThread;
@@ -269,8 +278,10 @@ public class CallLogProvider extends ContentProvider {
             limitClause = offset + "," + limit;
         }
 
+        final String groupby = getStringParam(uri, GROUP_BY, null);
+
         final SQLiteDatabase db = mDbHelper.getReadableDatabase();
-        final Cursor c = qb.query(db, projection, selectionBuilder.build(), selectionArgs, null,
+        final Cursor c = qb.query(db, projection, selectionBuilder.build(), selectionArgs, groupby,
                 null, sortOrder, limitClause);
         if (c != null) {
             c.setNotificationUri(getContext().getContentResolver(), CallLog.CONTENT_URI);
@@ -303,6 +314,23 @@ public class CallLogProvider extends ContentProvider {
         }
     }
 
+    /**
+     * Gets an String query parameter from a given uri.
+     *
+     * @param uri The uri to extract the query parameter from.
+     * @param key The query parameter key.
+     * @param defaultValue A default value to return if the query parameter does not exist.
+     * @return The value from the query parameter in the Uri.  Or the default value if the parameter
+     * does not exist in the uri.
+     */
+    private String getStringParam(Uri uri, String key, String defaultValue) {
+        String valueString = uri.getQueryParameter(key);
+        if (valueString == null) {
+            return defaultValue;
+        }
+        return valueString;
+    }
+
     @Override
     public String getType(Uri uri) {
         int match = sURIMatcher.match(uri);
@@ -326,6 +354,14 @@ public class CallLogProvider extends ContentProvider {
         }
         waitForAccess(mReadAccessLatch);
         checkForSupportedColumns(sCallsProjectionMap, values);
+        if (values.containsKey(Calls.PHONE_ACCOUNT_ID)
+                    && values.getAsInteger(Calls.PHONE_ACCOUNT_ID) != null) {
+            int subscription = values.getAsInteger(Calls.PHONE_ACCOUNT_ID);
+            if (subscription > SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
+                String operator = getNetworkSpnName(subscription);
+                values.put(CallLogDatabaseHelper.CALLS_OPERATOR, operator);
+            }
+        }
         // Inserting a voicemail record through call_log requires the voicemail
         // permission and also requires the additional voicemail param set.
         if (hasVoicemailValue(values)) {
@@ -406,6 +442,10 @@ public class CallLogProvider extends ContentProvider {
                 // shadow provider too.
                 return getDatabaseModifier(db).delete(Tables.CALLS,
                         selectionBuilder.build(), selectionArgs);
+            case CALLS_ID:
+                return getDatabaseModifier(db).delete(Tables.CALLS,
+                        new SelectionBuilder(Calls._ID + "=?").build(),
+                        new String[] { uri.getLastPathSegment() });
             default:
                 throw new UnsupportedOperationException("Cannot delete that URL: " + uri);
         }
@@ -599,6 +639,8 @@ public class CallLogProvider extends ContentProvider {
 
                     }
                 }
+            } catch(Exception e) {
+                Log.e(TAG, e.toString());
             } finally {
                 cursor.close();
             }
@@ -709,6 +751,40 @@ public class CallLogProvider extends ContentProvider {
             }
         } else if (task == BACKGROUND_TASK_ADJUST_PHONE_ACCOUNT) {
             adjustForNewPhoneAccountInternal((PhoneAccountHandle) arg);
+        }
+    }
+
+    private String getNetworkSpnName(int subscription) {
+        TelephonyManager tm = (TelephonyManager)
+                getContext().getSystemService(Context.TELEPHONY_SERVICE);
+        String netSpnName = "";
+        netSpnName = tm.getNetworkOperatorName(subscription);
+        if (TextUtils.isEmpty(netSpnName)) {
+            // if could not get the operator name, use sim name instead of
+            List<SubscriptionInfo> subInfoList =
+                    SubscriptionManager.from(getContext()).getActiveSubscriptionInfoList();
+            if (subInfoList != null) {
+                for (int i = 0; i < subInfoList.size(); ++i) {
+                    final SubscriptionInfo sir = subInfoList.get(i);
+                    if (sir.getSubscriptionId() == subscription) {
+                        netSpnName = sir.getDisplayName().toString();
+                        break;
+                    }
+                }
+            }
+        }
+        return toUpperCaseFirstOne(netSpnName);
+    }
+
+    private String toUpperCaseFirstOne(String s) {
+        if (TextUtils.isEmpty(s)) {
+            return s;
+        }
+        if (Character.isUpperCase(s.charAt(0))) {
+            return s;
+        } else {
+            return (new StringBuilder()).append(Character.toUpperCase(s.charAt(0)))
+                    .append(s.substring(1)).toString();
         }
     }
 }

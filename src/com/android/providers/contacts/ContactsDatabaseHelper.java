@@ -296,11 +296,11 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
          */
         public static final String GROUP_MEMBER_COUNT =
                 " LEFT OUTER JOIN (SELECT "
-                        + "data.data1 AS member_count_group_id, "
-                        + "COUNT(data.raw_contact_id) AS group_member_count "
-                    + "FROM data "
+                        + "view_data.data1 AS member_count_group_id, "
+                        + "COUNT(DISTINCT view_data.contact_id) AS group_member_count "
+                    + "FROM view_data "
                     + "WHERE "
-                        + "data.mimetype_id = (SELECT _id FROM mimetypes WHERE "
+                        + "view_data.mimetype_id = (SELECT _id FROM mimetypes WHERE "
                             + "mimetypes.mimetype = '" + GroupMembership.CONTENT_ITEM_TYPE + "')"
                     + "GROUP BY member_count_group_id) AS member_count_table" // End of inner query
                 + " ON (groups._id = member_count_table.member_count_group_id)";
@@ -347,9 +347,8 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
                 "(SELECT " + AccountsColumns._ID +
                 " FROM " + Tables.ACCOUNTS +
                 " WHERE " +
-                    AccountsColumns.ACCOUNT_NAME + " IS NULL AND " +
-                    AccountsColumns.ACCOUNT_TYPE + " IS NULL AND " +
-                    AccountsColumns.DATA_SET + " IS NULL)";
+                AccountsColumns.ACCOUNT_TYPE + "='" +
+                AccountWithDataSet.ACCOUNT_TYPE_PHONE + "')";
 
         final String RAW_CONTACT_IS_LOCAL = RawContactsColumns.CONCRETE_ACCOUNT_ID
                 + "=" + LOCAL_ACCOUNT_ID;
@@ -363,8 +362,6 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
                 "SELECT " +
                     "MAX((SELECT (CASE WHEN " +
                         "(CASE" +
-                            " WHEN " + RAW_CONTACT_IS_LOCAL +
-                            " THEN 1 " +
                             " WHEN " + ZERO_GROUP_MEMBERSHIPS +
                             " THEN " + Settings.UNGROUPED_VISIBLE +
                             " ELSE MAX(" + Groups.GROUP_VISIBLE + ")" +
@@ -1600,6 +1597,9 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
         // Add the legacy API support views, etc.
         LegacyApiSupport.createDatabase(db);
 
+        createPhoneAccount(db);
+        createDefaultGroups4PhoneAccount(db);
+
         if (mDatabaseOptimizationEnabled) {
             // This will create a sqlite_stat1 table that is used for query optimization
             db.execSQL("ANALYZE;");
@@ -2024,13 +2024,18 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
         String contactsSelect = "SELECT "
                 + ContactsColumns.CONCRETE_ID + " AS " + Contacts._ID + ","
                 + contactsColumns + ", "
+                + AccountsColumns.ACCOUNT_NAME + ", "
+                + AccountsColumns.ACCOUNT_TYPE + ", "
                 + buildDisplayPhotoUriAlias(ContactsColumns.CONCRETE_ID, Contacts.PHOTO_URI) + ", "
                 + buildThumbnailPhotoUriAlias(ContactsColumns.CONCRETE_ID,
                         Contacts.PHOTO_THUMBNAIL_URI) + ", "
                 + dbForProfile() + " AS " + Contacts.IS_USER_PROFILE
                 + " FROM " + Tables.CONTACTS
                 + " JOIN " + Tables.RAW_CONTACTS + " AS name_raw_contact ON("
-                +   Contacts.NAME_RAW_CONTACT_ID + "=name_raw_contact." + RawContacts._ID + ")";
+                +   Contacts.NAME_RAW_CONTACT_ID + "=name_raw_contact." + RawContacts._ID + ")"
+                + " JOIN " + Tables.ACCOUNTS + " AS name_accounts ON("
+                + "name_raw_contact." + RawContactsColumns.ACCOUNT_ID + "=name_accounts."
+                + AccountsColumns._ID + ")";
 
         db.execSQL("CREATE VIEW " + Views.CONTACTS + " AS " + contactsSelect);
 
@@ -3565,12 +3570,44 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
         insertNameLookup(db);
         rebuildSortKeys(db);
         createContactsIndexes(db, rebuildSqliteStats);
+        rebuildDefaultGroupTitles(db, locales.getPrimaryLocale());
 
         FastScrollingIndexCache.getInstance(mContext).invalidate();
         // Update the ICU version used to generate the locale derived data
         // so we can tell when we need to rebuild with new ICU versions.
         PropertyUtils.setProperty(db, DbProperties.ICU_VERSION, ICU.getIcuVersion());
         PropertyUtils.setProperty(db, DbProperties.LOCALE, locales.toString());
+    }
+
+    /**
+     * change the default groups' title according to the locale
+     */
+    private void rebuildDefaultGroupTitles(SQLiteDatabase db, Locale locale) {
+        String[] PROJECTION = new String[] {Groups._ID, Groups.TITLE_RES};
+        Cursor cursor = db.query(Tables.GROUPS, PROJECTION, Groups.TITLE_RES + " IS NOT NULL ", null
+            ,null, null, Groups._ID);
+
+        if (cursor == null) {
+            return;
+        }
+
+        try {
+            long groupId = -1;
+            int titleRes = 0;
+            ContentValues values = new ContentValues();
+            while (cursor.moveToNext()) {
+                groupId = cursor.getLong(0);
+                titleRes = cursor.getInt(1);
+                values.clear();
+                values.put(Groups.TITLE, mContext.getResources().getString(titleRes));
+                db.update(Tables.GROUPS, values, Groups._ID + " = ?", new String[] {
+                    String.valueOf(groupId)});
+            }
+        } catch (Exception e) {
+            Log.i(TAG, e.toString());
+        }  finally {
+            cursor.close();
+        }
     }
 
     /**
@@ -6223,6 +6260,7 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
                 new String[] {String.valueOf(contactId)});
     }
 
+
     public long upsertMetadataSync(String backupId, Long accountId, String data, Integer deleted) {
         if (mMetadataSyncInsert == null) {
             mMetadataSyncInsert = getWritableDatabase().compileStatement(
@@ -6239,5 +6277,55 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
         mMetadataSyncInsert.bindString(3, data);
         mMetadataSyncInsert.bindLong(4, deleted);
         return mMetadataSyncInsert.executeInsert();
+     }
+
+    private void createDefaultGroups4PhoneAccount(SQLiteDatabase db) {
+        // 3 default groups
+        String[] title = new String[3];
+        int[] titleRes = new int[3];
+
+        title[0] = mContext.getResources().getString(R.string.group_title_co_workers);
+        titleRes[0] = R.string.group_title_co_workers;
+
+        title[1] = mContext.getResources().getString(R.string.group_title_family);
+        titleRes[1] = R.string.group_title_family;
+
+        title[2] = mContext.getResources().getString(R.string.group_title_friends);
+        titleRes[2] = R.string.group_title_friends;
+
+        for (int i = 0; i < title.length; i++) {
+            db.execSQL("INSERT INTO " + Tables.GROUPS + " (" +
+                GroupsColumns.ACCOUNT_ID + "," +
+                Groups.SOURCE_ID + "," +
+                Groups.VERSION + "," +
+                Groups.DIRTY + "," +
+                Groups.TITLE + "," +
+                Groups.TITLE_RES + "," +
+                Groups.NOTES + "," +
+                Groups.SYSTEM_ID + "," +
+                Groups.DELETED + "," +
+                Groups.GROUP_VISIBLE + "," +
+                Groups.SHOULD_SYNC + "," +
+                Groups.AUTO_ADD + "," +
+                Groups.FAVORITES + "," +
+                Groups.GROUP_IS_READ_ONLY + "," +
+                Groups.SYNC1 + ", " +
+                Groups.SYNC2 + ", " +
+                Groups.SYNC3 + ", " +
+                Groups.SYNC4 + ") " +
+                "VALUES (1,1,1,0,'"
+                    + title[i] + "'," + titleRes[i] +
+                    ",NULL,NULL,0,1,1,0,0,1,'','','','');"
+            );
+        }
+    }
+
+    public void createPhoneAccount(SQLiteDatabase db) {
+        String sql = "INSERT INTO " + Tables.ACCOUNTS
+            + "(" + AccountsColumns.ACCOUNT_NAME + ","
+            + AccountsColumns.ACCOUNT_TYPE + ") "
+            + "VALUES ('" + AccountWithDataSet.PHONE_NAME + "','"
+            + AccountWithDataSet.ACCOUNT_TYPE_PHONE + "')";
+        db.execSQL(sql);
     }
 }

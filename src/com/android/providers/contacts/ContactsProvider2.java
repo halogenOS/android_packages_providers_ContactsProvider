@@ -255,6 +255,8 @@ public class ContactsProvider2 extends AbstractContactsProvider
     private static final int BACKGROUND_TASK_CHANGE_LOCALE = 9;
     private static final int BACKGROUND_TASK_CLEANUP_PHOTOS = 10;
     private static final int BACKGROUND_TASK_CLEAN_DELETE_LOG = 11;
+    private static final int BACKGROUND_TASK_UPDATE_DEFAULT_CONTACTS = 12;
+    private static final int BACKGROUND_TASK_PRELOAD_CONTACT = 13;
 
     protected static final int STATUS_NORMAL = 0;
     protected static final int STATUS_UPGRADING = 1;
@@ -315,7 +317,11 @@ public class ContactsProvider2 extends AbstractContactsProvider
 
     private static final String FREQUENT_ORDER_BY = DataUsageStatColumns.TIMES_USED + " DESC,"
             + Contacts.DISPLAY_NAME + " COLLATE LOCALIZED ASC";
+    private static String WITHOUT_SIM_FLAG  = "no_sim";
 
+    private boolean isWhereAppended = false;
+
+    public static final String ADD_GROUP_MEMBERS = "add_group_members";
     public static final int CONTACTS = 1000;
     public static final int CONTACTS_ID = 1001;
     public static final int CONTACTS_LOOKUP = 1002;
@@ -554,6 +560,22 @@ public class ContactsProvider2 extends AbstractContactsProvider
                                     + "(SELECT " + Tables.GROUPS + "." + Groups._ID
                                     + " FROM " + Tables.GROUPS
                                     + " WHERE " + Groups.TITLE + "=?)))";
+
+    private static final String CONTACTS_IN_GROUP_ID_SELECT =
+            Contacts._ID + " IN "
+                    + "(SELECT DISTINCT "
+                    + Data.CONTACT_ID
+                    + " FROM " + Views.DATA
+                    + " WHERE " + Data.MIMETYPE + " = '" + GroupMembership.CONTENT_ITEM_TYPE
+                    + "' AND " + Data.DATA1 + " = ?)";
+
+    private static final String CONTACTS_NOT_IN_GROUP_ID_SELECT =
+            Contacts._ID + " NOT IN "
+                    + "(SELECT DISTINCT "
+                    + Data.CONTACT_ID
+                    + " FROM " + Views.DATA
+                    + " WHERE " + Data.MIMETYPE + " = '" + GroupMembership.CONTENT_ITEM_TYPE
+                    + "' AND " + Data.DATA1 + " = ?)";
 
     /** Sql for updating DIRTY flag on multiple raw contacts */
     private static final String UPDATE_RAW_CONTACT_SET_DIRTY_SQL =
@@ -811,6 +833,8 @@ public class ContactsProvider2 extends AbstractContactsProvider
             .add(Contacts.IS_USER_PROFILE)
             .addAll(sContactsColumns)
             .addAll(sContactsPresenceColumns)
+            .add(RawContacts.ACCOUNT_TYPE)
+            .add(RawContacts.ACCOUNT_NAME)
             .build();
 
     /** Contains just the contacts columns */
@@ -960,6 +984,7 @@ public class ContactsProvider2 extends AbstractContactsProvider
             .addAll(sDataColumns)
             .addAll(sDataPresenceColumns)
             .addAll(sContactsColumns)
+            .addAll(sRawContactColumns)
             .addAll(sContactPresenceColumns)
             .addAll(sDataUsageColumns)
             .build();
@@ -1248,6 +1273,7 @@ public class ContactsProvider2 extends AbstractContactsProvider
         matcher.addURI(ContactsContract.AUTHORITY, "contacts/strequent/", CONTACTS_STREQUENT);
         matcher.addURI(ContactsContract.AUTHORITY, "contacts/strequent/filter/*",
                 CONTACTS_STREQUENT_FILTER);
+        matcher.addURI(ContactsContract.AUTHORITY, "contacts/group", CONTACTS_GROUP);
         matcher.addURI(ContactsContract.AUTHORITY, "contacts/group/*", CONTACTS_GROUP);
         matcher.addURI(ContactsContract.AUTHORITY, "contacts/frequent", CONTACTS_FREQUENT);
         matcher.addURI(ContactsContract.AUTHORITY, "contacts/delete_usage", CONTACTS_DELETE_USAGE);
@@ -1523,6 +1549,7 @@ public class ContactsProvider2 extends AbstractContactsProvider
     private Handler mBackgroundHandler;
 
     private long mLastPhotoCleanup = 0;
+    private boolean isPreloadRjilContactInfoEnabled;
 
     private FastScrollingIndexCache mFastScrollingIndexCache;
 
@@ -1606,6 +1633,8 @@ public class ContactsProvider2 extends AbstractContactsProvider
         mProfileProvider.attachInfo(getContext(), profileInfo);
         mProfileHelper = mProfileProvider.getDatabaseHelper(getContext());
         mEnterprisePolicyGuard = new EnterprisePolicyGuard(getContext());
+        isPreloadRjilContactInfoEnabled = getContext().getResources().getBoolean(
+                R.bool.support_preload_contact_info);
 
         // Initialize the pre-authorized URI duration.
         mPreAuthorizedUriDuration = DEFAULT_PREAUTHORIZED_URI_EXPIRATION;
@@ -1619,6 +1648,9 @@ public class ContactsProvider2 extends AbstractContactsProvider
         scheduleBackgroundTask(BACKGROUND_TASK_OPEN_WRITE_ACCESS);
         scheduleBackgroundTask(BACKGROUND_TASK_CLEANUP_PHOTOS);
         scheduleBackgroundTask(BACKGROUND_TASK_CLEAN_DELETE_LOG);
+        if (isPreloadRjilContactInfoEnabled) {
+            scheduleBackgroundTask(BACKGROUND_TASK_PRELOAD_CONTACT);
+        }
 
         return true;
     }
@@ -1712,6 +1744,90 @@ public class ContactsProvider2 extends AbstractContactsProvider
                 new DataRowHandlerForNote(context, dbHelper, contactAggregator));
         handlerMap.put(Identity.CONTENT_ITEM_TYPE,
                 new DataRowHandlerForIdentity(context, dbHelper, contactAggregator));
+    }
+
+    private void importPreloadContact() {
+        final int PRLOAD_CONTACT_COUNT =
+                getContext().getResources().getInteger(R.integer.preload_contact_count);
+        final String PRLOAD_CONTACT_DETAIL_INFO [] =
+                getContext().getResources().getStringArray(R.array.preload_contact_detail_info);
+        final int SUB_ITEMS_COUNT= PRLOAD_CONTACT_DETAIL_INFO.length/PRLOAD_CONTACT_COUNT;
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                for(int i = 0;i < PRLOAD_CONTACT_COUNT; i++)
+                {
+                    Uri uri = Uri.withAppendedPath(PhoneLookup.CONTENT_FILTER_URI, Uri
+                            .encode(PRLOAD_CONTACT_DETAIL_INFO[SUB_ITEMS_COUNT*i+1]));
+                    Cursor contactCursor = getContext().getContentResolver().query(uri,
+                            new String[] {PhoneLookup.DISPLAY_NAME}, null, null, null);
+                    try {
+                        if (contactCursor != null && contactCursor.getCount() > 0) {
+                            return;
+                        } else {
+                            final ArrayList<ContentProviderOperation> operationList = new
+                                    ArrayList<ContentProviderOperation>();
+                            ContentProviderOperation.Builder builder = ContentProviderOperation
+                                   .newInsert(RawContacts.CONTENT_URI);
+                            ContentValues contactvalues = new ContentValues();
+                            contactvalues.put(RawContacts.ACCOUNT_NAME,
+                                    AccountWithDataSet.PHONE_NAME);
+                            contactvalues.put(RawContacts.ACCOUNT_TYPE,
+                                    AccountWithDataSet.ACCOUNT_TYPE_PHONE);
+                            builder.withValues(contactvalues);
+                            builder.withValue(RawContacts.AGGREGATION_MODE,
+                                    RawContacts.AGGREGATION_MODE_DISABLED);
+                            operationList.add(builder.build());
+                            Log.i(TAG, "CP2 insert contact info");
+
+                            if ( PRLOAD_CONTACT_DETAIL_INFO[SUB_ITEMS_COUNT*i + 1] != null ) {
+                                builder = ContentProviderOperation.newInsert(Data.CONTENT_URI);
+                                builder.withValueBackReference(Phone.RAW_CONTACT_ID, 0);
+                                builder.withValue(Data.MIMETYPE, Phone.CONTENT_ITEM_TYPE);
+                                builder.withValue(Phone.TYPE, Phone.TYPE_MOBILE);
+                                builder.withValue(Phone.NUMBER,
+                                        PRLOAD_CONTACT_DETAIL_INFO[SUB_ITEMS_COUNT*i + 1]);
+                                builder.withValue(Data.IS_PRIMARY, 1);
+                                operationList.add(builder.build());
+                            }
+
+                            if ( PRLOAD_CONTACT_DETAIL_INFO[SUB_ITEMS_COUNT*i] != null ) {
+                                builder = ContentProviderOperation.newInsert(Data.CONTENT_URI);
+                                builder.withValueBackReference(StructuredName.RAW_CONTACT_ID, 0);
+                                builder.withValue(Data.MIMETYPE, StructuredName.CONTENT_ITEM_TYPE);
+                                builder.withValue(StructuredName.DISPLAY_NAME,
+                                        PRLOAD_CONTACT_DETAIL_INFO[SUB_ITEMS_COUNT*i]);
+                                operationList.add(builder.build());
+                            }
+
+                            if ( PRLOAD_CONTACT_DETAIL_INFO[SUB_ITEMS_COUNT*i + 2] != null ) {
+                                builder = ContentProviderOperation.newInsert(Data.CONTENT_URI);
+                                builder.withValueBackReference(Email.RAW_CONTACT_ID, 0);
+                                builder.withValue(Data.MIMETYPE, Email.CONTENT_ITEM_TYPE);
+                                builder.withValue(Email.TYPE, Email.TYPE_MOBILE);
+                                builder.withValue(Email.ADDRESS,
+                                        PRLOAD_CONTACT_DETAIL_INFO[SUB_ITEMS_COUNT*i + 2]);
+                                operationList.add(builder.build());
+                            }
+
+                            try {
+                                getContext().getContentResolver().applyBatch(
+                                        ContactsContract.AUTHORITY, operationList);
+                            } catch (RemoteException e) {
+                                Log.e(TAG, String.format("%s: %s", e.toString(), e.getMessage()));
+                            } catch (OperationApplicationException e) {
+                                Log.e(TAG, String.format("%s: %s", e.toString(), e.getMessage()));
+                            }
+                        }
+                    } finally {
+
+                        if (contactCursor != null) {
+                            contactCursor.close();
+                        }
+                    }
+                 }//for
+            }
+        }).start();
     }
 
     @VisibleForTesting
@@ -1822,6 +1938,15 @@ public class ContactsProvider2 extends AbstractContactsProvider
             case BACKGROUND_TASK_CLEAN_DELETE_LOG: {
                 final SQLiteDatabase db = mDbHelper.get().getWritableDatabase();
                 DeletedContactsTableUtil.deleteOldLogs(db);
+                break;
+            }
+
+            case BACKGROUND_TASK_UPDATE_DEFAULT_CONTACTS: {
+                updateDefaultContacts();
+                break;
+            }
+            case BACKGROUND_TASK_PRELOAD_CONTACT: {
+                importPreloadContact();
                 break;
             }
         }
@@ -2050,6 +2175,75 @@ public class ContactsProvider2 extends AbstractContactsProvider
                 db.endTransaction();
             }
         }
+    }
+
+    public void onContactsDbCreated() {
+        Log.i(TAG, "onContactsDbCreated");
+        if (mProviderStatus != STATUS_NORMAL
+                && mProviderStatus != STATUS_NO_ACCOUNTS_NO_CONTACTS) {
+            return;
+        }
+        scheduleBackgroundTask(BACKGROUND_TASK_UPDATE_DEFAULT_CONTACTS);
+    }
+
+    private boolean isEmergencyOnpowerButtonTapEnabled(Resources resources) {
+        return SystemProperties.getBoolean(
+                "persist.sys.ecall_pwr_key_press", false) ||
+                resources.getBoolean(
+                com.android.internal.R.bool.config_emergencyCallOnPowerkeyTapGestureEnabled);
+    }
+
+    private void updateDefaultContacts() {
+        Resources resources = getContext().getResources();
+        if (isEmergencyOnpowerButtonTapEnabled(resources)) {
+            createEmergencyContact(resources);
+        }
+    }
+
+    private void createEmergencyContact(Resources resources) {
+        ContentResolver resolver = getContext().getContentResolver();
+        final String emergencyNumber = resources.getString(
+            com.android.internal.R.string.power_key_emergency_number);
+        final String emergencyDisplayName = resources.getString(
+            com.android.internal.R.string.emergency_call_dialog_number_for_display);
+
+        ContentValues values = new ContentValues();
+        Uri rawContactUri = getContext().getContentResolver().insert(
+                ContactsContract.RawContacts.CONTENT_URI,values);
+        long rawContactId = ContentUris.parseId(rawContactUri);
+
+        Log.i(TAG, "createEmergencyContact name " + emergencyDisplayName
+                + " Contact Number " + emergencyNumber);
+        insertStructuredName(resolver, rawContactId, emergencyDisplayName);
+        insertPhoneNumber(resolver, rawContactId,
+                emergencyNumber,
+                ContactsContract.CommonDataKinds.Phone.TYPE_MOBILE);
+    }
+
+    private static Uri insertStructuredName(ContentResolver resolver,
+                                           long rawContactId,
+                                           String name) {
+        ContentValues values = new ContentValues();
+        values.put(StructuredName.DISPLAY_NAME, name);
+        values.put(ContactsContract.Data.RAW_CONTACT_ID, rawContactId);
+        values.put(ContactsContract.Data.MIMETYPE,
+                ContactsContract.CommonDataKinds.StructuredName.CONTENT_ITEM_TYPE);
+        Uri resultUri = resolver.insert(ContactsContract.Data.CONTENT_URI, values);
+        return resultUri;
+    }
+
+    private static Uri insertPhoneNumber(ContentResolver contentResolver,
+                                         long rawContactId,
+                                         String phoneNumber,
+                                         int type) {
+        ContentValues values = new ContentValues();
+        values.put(ContactsContract.Data.RAW_CONTACT_ID, rawContactId);
+        values.put(ContactsContract.Data.MIMETYPE,
+                ContactsContract.CommonDataKinds.Phone.CONTENT_ITEM_TYPE);
+        values.put(ContactsContract.CommonDataKinds.Phone.NUMBER, phoneNumber);
+        values.put(ContactsContract.CommonDataKinds.Phone.TYPE, type);
+        values.put(ContactsContract.CommonDataKinds.Phone.LABEL, "Mobile");
+        return contentResolver.insert(ContactsContract.Data.CONTENT_URI, values);
     }
 
     @Override
@@ -2899,7 +3093,7 @@ public class ContactsProvider2 extends AbstractContactsProvider
         mSyncToMetadataNetWork |= callerIsSyncAdapter;
 
         final int aggregationMode = getIntValue(values, RawContacts.AGGREGATION_MODE,
-                RawContacts.AGGREGATION_MODE_DEFAULT);
+                RawContacts.AGGREGATION_MODE_SUSPENDED);
         mAggregator.get().markNewForAggregation(rawContactId, aggregationMode);
 
         // Trigger creation of a Contact based on this RawContact at the end of transaction.
@@ -5906,6 +6100,36 @@ public class ContactsProvider2 extends AbstractContactsProvider
                 setTablesAndProjectionMapForContactsWithSnippet(
                         qb, uri, projection, filterParam, directoryId,
                         snippetDeferred);
+                long groupId = -1;
+                try {
+                    groupId = Long.parseLong(uri.getQueryParameter(Groups._ID));
+                } catch (Exception exception) {
+                    groupId = -1;
+                }
+                if (groupId != -1) {
+                    StringBuilder groupBuilder = new StringBuilder();
+                    if (uri.getBooleanQueryParameter(ADD_GROUP_MEMBERS, false)) {
+                        // filter all the contacts that are NOT assigned to the
+                        // group whose id is 'groupId'
+                        groupBuilder.append(Contacts._ID + " NOT IN (" + " SELECT DISTINCT "
+                                + Data.CONTACT_ID
+                                + " FROM " + Views.DATA + " WHERE " + Data.MIMETYPE + " = '"
+                                + GroupMembership.CONTENT_ITEM_TYPE + "' AND " + Data.DATA1
+                                + " = " + groupId + ")");
+                    } else {
+                        // filter all the contacts that are assigned to the
+                        // group whose id is 'groupId'
+                        groupBuilder.append(Contacts._ID + " IN (" + " SELECT DISTINCT "
+                                + Data.CONTACT_ID
+                                + " FROM " + Views.DATA + " WHERE " + Data.MIMETYPE + " = '"
+                                + GroupMembership.CONTENT_ITEM_TYPE + "' AND " + Data.DATA1
+                                + " = " + groupId + ")");
+                    }
+                    if (isWhereAppended) {
+                        qb.appendWhere(" AND ");
+                    }
+                    qb.appendWhere(groupBuilder.toString());
+                }
                 break;
             }
             case CONTACTS_STREQUENT_FILTER:
@@ -6086,7 +6310,23 @@ public class ContactsProvider2 extends AbstractContactsProvider
 
             case CONTACTS_GROUP: {
                 setTablesAndProjectionMapForContacts(qb, projection);
-                if (uri.getPathSegments().size() > 2) {
+                appendLocalDirectoryAndAccountSelectionIfNeeded(qb, directoryId, uri);
+                long groupId = -1;
+                try {
+                    groupId = Long.parseLong(uri.getQueryParameter(Groups._ID));
+                } catch (Exception exception) {
+                    groupId = -1;
+                }
+                if (groupId != -1) {
+                    qb.appendWhere(" AND ");
+                    if (uri.getBooleanQueryParameter(ADD_GROUP_MEMBERS, false)) {
+                        qb.appendWhere(CONTACTS_NOT_IN_GROUP_ID_SELECT);
+                    } else {
+                        qb.appendWhere(CONTACTS_IN_GROUP_ID_SELECT);
+                    }
+                    selectionArgs = insertSelectionArg(selectionArgs, String.valueOf(groupId));
+                } else if (uri.getPathSegments().size() > 2) {
+                    qb.appendWhere(" AND ");
                     qb.appendWhere(CONTACTS_IN_GROUP_SELECT);
                     String groupMimeTypeId = String.valueOf(
                             mDbHelper.get().getMimeTypeId(GroupMembership.CONTENT_ITEM_TYPE));
@@ -7978,8 +8218,62 @@ public class ContactsProvider2 extends AbstractContactsProvider
     private void setTablesAndProjectionMapForContactsWithSnippet(SQLiteQueryBuilder qb, Uri uri,
             String[] projection, String filter, long directoryId, boolean deferSnippeting) {
 
+        isWhereAppended = false;
         StringBuilder sb = new StringBuilder();
         sb.append(Views.CONTACTS);
+
+        /* Do not show contacts when SIM card is disabled for CONTACTS_FILTER */
+        StringBuilder sbWhere = new StringBuilder();
+        String withoutSim = getQueryParameter(uri, WITHOUT_SIM_FLAG );
+        if ("true".equals(withoutSim)) {
+            final long[] accountId = getAccountIdWithoutSim(uri);
+            if (accountId == null) {
+                // No such account.
+                sbWhere.setLength(0);
+                sbWhere.append("(1=2)");
+            } else {
+                if (accountId.length > 0) {
+                    sbWhere.append(" (" + Contacts._ID + " not IN (" + "SELECT "
+                            + RawContacts.CONTACT_ID + " FROM "
+                            + Tables.RAW_CONTACTS + " WHERE "
+                            + RawContacts.CONTACT_ID + " not NULL AND ( ");
+                    for (int i = 0; i < accountId.length; i++) {
+                        sbWhere.append(RawContactsColumns.ACCOUNT_ID + "="
+                                + accountId[i]);
+                        if (i != accountId.length - 1) {
+                            sbWhere.append(" OR ");
+                        }
+                    }
+                    sbWhere.append(")))");
+                }
+            }
+        } else {
+            final AccountWithDataSet accountWithDataSet = getAccountWithDataSetFromUri(uri);
+            // Accounts are valid by only checking one parameter, since we've
+            // already ruled out partial accounts.
+            final boolean validAccount = !TextUtils.isEmpty(accountWithDataSet.getAccountName());
+            if (validAccount) {
+                final Long accountId = mDbHelper.get().getAccountIdOrNull(accountWithDataSet);
+                if (accountId != null) {
+                    sbWhere.append(" INNER JOIN (SELECT "
+                            + RawContacts.CONTACT_ID
+                            + " AS raw_contact_contact_id FROM "
+                            + Tables.RAW_CONTACTS + " WHERE "
+                            + RawContactsColumns.ACCOUNT_ID + " = "
+                            + accountId
+                            + ") ON raw_contact_contact_id = " + Contacts._ID);
+                }
+            }
+        }
+
+        if (!TextUtils.isEmpty(sbWhere.toString())) {
+            if ("true".equals(withoutSim)) {
+                qb.appendWhere(sbWhere.toString());
+                isWhereAppended = true;
+            } else {
+                sb.append(sbWhere.toString());
+            }
+        }
 
         if (filter != null) {
             filter = filter.trim();
@@ -8405,22 +8699,50 @@ public class ContactsProvider2 extends AbstractContactsProvider
             sb.append("(1)");
         }
 
-        final AccountWithDataSet accountWithDataSet = getAccountWithDataSetFromUri(uri);
-        // Accounts are valid by only checking one parameter, since we've
-        // already ruled out partial accounts.
-        final boolean validAccount = !TextUtils.isEmpty(accountWithDataSet.getAccountName());
-        if (validAccount) {
-            final Long accountId = mDbHelper.get().getAccountIdOrNull(accountWithDataSet);
+        String withoutSim = getQueryParameter(uri, WITHOUT_SIM_FLAG );
+        if ("true".equals(withoutSim)) {
+            final long[] accountId = getAccountIdWithoutSim(uri);
+
             if (accountId == null) {
                 // No such account.
                 sb.setLength(0);
                 sb.append("(1=2)");
             } else {
-                sb.append(
-                        " AND (" + Contacts._ID + " IN (" +
-                        "SELECT " + RawContacts.CONTACT_ID + " FROM " + Tables.RAW_CONTACTS +
-                        " WHERE " + RawContactsColumns.ACCOUNT_ID + "=" + accountId.toString() +
-                        "))");
+                if (accountId.length > 0) {
+                    sb.append(
+                            " AND (" + Contacts._ID + " not IN (" +
+                                    "SELECT " + RawContacts.CONTACT_ID + " FROM "
+                                    + Tables.RAW_CONTACTS +
+                                    " WHERE " + RawContacts.CONTACT_ID + " not NULL AND ( ");
+                    for (int i = 0; i < accountId.length; i++) {
+                        sb.append(RawContactsColumns.ACCOUNT_ID + "="
+                                + accountId[i]);
+                        if (i != accountId.length - 1) {
+                            sb.append(" or ");
+                        }
+                    }
+                    sb.append(")))");
+                }
+            }
+        }
+        else {
+            final AccountWithDataSet accountWithDataSet = getAccountWithDataSetFromUri(uri);
+            // Accounts are valid by only checking one parameter, since we've
+            // already ruled out partial accounts.
+            final boolean validAccount = !TextUtils.isEmpty(accountWithDataSet.getAccountName());
+            if (validAccount) {
+                final Long accountId = mDbHelper.get().getAccountIdOrNull(accountWithDataSet);
+                if (accountId == null) {
+                    // No such account.
+                    sb.setLength(0);
+                    sb.append("(1=2)");
+                } else {
+                    sb.append(
+                            " AND (" + Contacts._ID + " IN (" +
+                            "SELECT " + RawContacts.CONTACT_ID + " FROM " + Tables.RAW_CONTACTS +
+                            " WHERE " + RawContactsColumns.ACCOUNT_ID + "=" + accountId.toString() +
+                            "))");
+                }
             }
         }
         qb.appendWhere(sb.toString());
@@ -8468,6 +8790,56 @@ public class ContactsProvider2 extends AbstractContactsProvider
         } else {
             qb.appendWhere("1");
         }
+    }
+
+    private long[] getAccountIdWithoutSim(Uri uri) {
+        final String accountType = getQueryParameter(uri, RawContacts.ACCOUNT_TYPE);
+        final String accountName = getQueryParameter(uri, RawContacts.ACCOUNT_NAME);
+        Cursor c = null;
+        SQLiteDatabase db = mContactsHelper.getWritableDatabase();
+        long[] accountId = null;
+        try {
+            if (null != accountType) {
+                c = db.query(Tables.ACCOUNTS,
+                        new String[] { AccountsColumns._ID },
+                        AccountsColumns.ACCOUNT_TYPE + "=?",
+                        new String[] { String.valueOf(accountType) }, null,
+                        null, null);
+            } else if (!TextUtils.isEmpty(accountName)) {
+                String[] names = accountName.split(",");
+                int nameCount = names.length;
+                String where = AccountsColumns.ACCOUNT_NAME + "=?";
+                StringBuilder selection = new StringBuilder();
+                String[] selectionArgs = new String[nameCount];
+                for (int i = 0; i < nameCount; i++) {
+                    selection.append(where);
+                    if (i != nameCount - 1) {
+                        selection.append(" OR ");
+                    }
+                    selectionArgs[i] = names[i];
+                }
+                c = db.query(Tables.ACCOUNTS,
+                        new String[] { AccountsColumns._ID },
+                        selection.toString(),
+                        selectionArgs, null,
+                        null, null);
+            }
+
+            if (c != null) {
+                accountId = new long[c.getCount()];
+
+                for (int i = 0; i < c.getCount(); i++) {
+                    if (c.moveToNext()) {
+                        accountId[c.getPosition()] = c.getInt(0);
+                    }
+                }
+            }
+        } finally {
+            if (c != null) {
+                c.close();
+            }
+        }
+        return accountId;
     }
 
     private AccountWithDataSet getAccountWithDataSetFromUri(Uri uri) {

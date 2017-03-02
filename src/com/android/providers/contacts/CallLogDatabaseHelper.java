@@ -53,6 +53,7 @@ public class CallLogDatabaseHelper {
     private final Context mContext;
 
     private final OpenHelper mOpenHelper;
+    public static final String CALLS_OPERATOR = "operator";
 
     public interface Tables {
         String CALLS = "calls";
@@ -151,7 +152,8 @@ public class CallLogDatabaseHelper {
                     Voicemails.TRANSCRIPTION + " TEXT," +
                     Voicemails.STATE + " INTEGER," +
                     Voicemails.DIRTY + " INTEGER NOT NULL DEFAULT 0," +
-                    Voicemails.DELETED + " INTEGER NOT NULL DEFAULT 0" +
+                    Voicemails.DELETED + " INTEGER NOT NULL DEFAULT 0," +
+                    CALLS_OPERATOR + " TEXT" +
                     ");");
 
             db.execSQL("CREATE TABLE " + Tables.VOICEMAIL_STATUS + " (" +
@@ -176,10 +178,6 @@ public class CallLogDatabaseHelper {
         public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
             if (DEBUG) {
                 Log.d(TAG, "onUpgrade");
-            }
-
-            if (oldVersion < 2) {
-                upgradeToVersion2(db);
             }
 
             if (oldVersion < 3) {
@@ -227,19 +225,12 @@ public class CallLogDatabaseHelper {
     }
 
     /**
-     * Add the {@link Calls.VIA_NUMBER} Column to the CallLog Database.
-     */
-    private void upgradeToVersion2(SQLiteDatabase db) {
-        db.execSQL("ALTER TABLE " + Tables.CALLS + " ADD " + Calls.VIA_NUMBER +
-                " TEXT NOT NULL DEFAULT ''");
-    }
-
-    /**
      * Add the {@link Status.SOURCE_TYPE} Column to the VoicemailStatus Database.
      */
     private void upgradeToVersion3(SQLiteDatabase db) {
         db.execSQL("ALTER TABLE " + Tables.VOICEMAIL_STATUS + " ADD " + Status.SOURCE_TYPE +
-                " TEXT");
+                " TEXT;");
+        db.execSQL("ALTER TABLE " + Tables.CALLS + " ADD " + CALLS_OPERATOR + " TEXT;");
     }
 
     /**
