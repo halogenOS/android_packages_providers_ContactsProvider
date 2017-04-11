@@ -156,7 +156,7 @@ public class CallLogDatabaseHelper {
                     Voicemails.BACKED_UP + " INTEGER NOT NULL DEFAULT 0," +
                     Voicemails.RESTORED + " INTEGER NOT NULL DEFAULT 0," +
                     Voicemails.ARCHIVED + " INTEGER NOT NULL DEFAULT 0," +
-                    Voicemails.IS_OMTP_VOICEMAIL + " INTEGER NOT NULL DEFAULT 0" +
+                    Voicemails.IS_OMTP_VOICEMAIL + " INTEGER NOT NULL DEFAULT 0," +
                     CALLS_OPERATOR + " TEXT" +
                     ");");
 
