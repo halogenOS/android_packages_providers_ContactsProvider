@@ -153,11 +153,11 @@ public class CallLogDatabaseHelper {
                     Voicemails.STATE + " INTEGER," +
                     Voicemails.DIRTY + " INTEGER NOT NULL DEFAULT 0," +
                     Voicemails.DELETED + " INTEGER NOT NULL DEFAULT 0," +
+                    CALLS_OPERATOR + " TEXT," +
                     Voicemails.BACKED_UP + " INTEGER NOT NULL DEFAULT 0," +
                     Voicemails.RESTORED + " INTEGER NOT NULL DEFAULT 0," +
                     Voicemails.ARCHIVED + " INTEGER NOT NULL DEFAULT 0," +
-                    Voicemails.IS_OMTP_VOICEMAIL + " INTEGER NOT NULL DEFAULT 0," +
-                    CALLS_OPERATOR + " TEXT" +
+                    Voicemails.IS_OMTP_VOICEMAIL + " INTEGER NOT NULL DEFAULT 0" +
                     ");");
 
             db.execSQL("CREATE TABLE " + Tables.VOICEMAIL_STATUS + " (" +
